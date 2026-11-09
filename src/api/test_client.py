@@ -20,7 +20,7 @@ def test_api(pdf_path: str, base_url: str = "http://localhost:8023"):
     print(f"   Status: {response.status_code}")
     try:
         print(f"   Response: {response.json()}")
-    except:
+    except Exception:
         print(f"   Response: {response.text}")
 
     # 2. System diagnostics
@@ -48,7 +48,7 @@ def test_api(pdf_path: str, base_url: str = "http://localhost:8023"):
         }
         response = requests.post(f"{base_url}/ocr", files=files, data=data)
 
-    if response.status_code != 200:
+    if response.status_code not in (200, 202):
         print(f"   Error: Upload failed with status {response.status_code}")
         print(f"   Response: {response.json()}")
         return
@@ -58,18 +58,36 @@ def test_api(pdf_path: str, base_url: str = "http://localhost:8023"):
     print(f"   Job ID: {job_id}")
     print(f"   Status: {result['status']}")
 
-    # 4. Get job status
-    print(f"\n4. Getting Job Status...")
-    response = requests.get(f"{base_url}/ocr/{job_id}/status")
-    status = response.json()
-    print(f"   Status: {status['status']}")
-    print(f"   Filename: {status['filename']}")
-    if status["status"] == "completed":
+    # 4. Wait for the job to finish
+    print("\n4. Waiting for Job...")
+    deadline = time.time() + 600
+    status = {}
+    while time.time() < deadline:
+        response = requests.get(f"{base_url}/ocr/{job_id}/status")
+        status = response.json()
+        if status.get("status") in {"completed", "failed", "cancelled"}:
+            break
+        print(
+            f"   Status: {status.get('status')} "
+            f"({status.get('pages_processed', 0)}/"
+            f"{status.get('pages_total', '?')} pages)"
+        )
+        time.sleep(2)
+
+    print(f"   Final status: {status.get('status')}")
+    print(f"   Filename: {status.get('filename')}")
+    if status.get("status") not in {"completed", "failed", "cancelled"}:
+        print("   Timed out waiting for the job. Check /status later.")
+        return
+    if status.get("status") == "completed":
         print(f"   Total Pages: {status.get('total_pages', 'N/A')}")
         print(f"   Total Numerals: {status.get('total_numerals', 'N/A')}")
+    elif status.get("status") in {"failed", "cancelled"}:
+        print(f"   Error: {status.get('error', status.get('status'))}")
+        return
 
     # 5. Get results summary
-    print(f"\n5. Getting Results Summary...")
+    print("\n5. Getting Results Summary...")
     response = requests.get(f"{base_url}/ocr/{job_id}/results")
     if response.status_code == 200:
         results = response.json()
@@ -82,7 +100,7 @@ def test_api(pdf_path: str, base_url: str = "http://localhost:8023"):
             print(f"   ... and {len(results['pages']) - 3} more pages")
 
     # 6. Download text output
-    print(f"\n6. Downloading Text Output...")
+    print("\n6. Downloading Text Output...")
     response = requests.get(f"{base_url}/ocr/{job_id}/text")
     if response.status_code == 200:
         output_file = f"test_output_{job_id}.txt"
@@ -95,7 +113,7 @@ def test_api(pdf_path: str, base_url: str = "http://localhost:8023"):
         print(f"   Preview: {preview}...")
 
     # 7. Download JSON output
-    print(f"\n7. Downloading JSON Output...")
+    print("\n7. Downloading JSON Output...")
     response = requests.get(f"{base_url}/ocr/{job_id}/json")
     if response.status_code == 200:
         output_file = f"test_output_{job_id}.json"
@@ -117,6 +135,6 @@ if __name__ == "__main__":
         sys.exit(1)
 
     pdf_path = sys.argv[1]
-    base_url = sys.argv[2] if len(sys.argv) > 2 else "http://localhost:8000"
+    base_url = sys.argv[2] if len(sys.argv) > 2 else "http://localhost:8023"
 
     test_api(pdf_path, base_url)

@@ -18,7 +18,9 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from starlette.concurrency import run_in_threadpool
 
@@ -63,6 +65,28 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    """Return a consistent error shape for invalid requests."""
+    return JSONResponse(
+        status_code=422,
+        content={
+            "detail": "Request validation failed",
+            "errors": jsonable_encoder(exc.errors()),
+        },
+    )
+
+
+def _results_not_ready(job: dict[str, Any]) -> HTTPException:
+    """Build a 409 error for output requested before a job is completed."""
+    detail = f"Job status: {job['status']}. Results not available yet."
+    if job.get("error"):
+        detail += f" Error: {job['error']}"
+    return HTTPException(status_code=409, detail=detail)
 
 
 def _safe_filename(filename: str | None) -> str:
@@ -126,7 +150,14 @@ async def diagnostics():
         raise HTTPException(status_code=500, detail=f"Diagnostics failed: {e!s}")
 
 
-@app.post("/ocr")
+@app.post(
+    "/ocr",
+    responses={
+        202: {"description": "Job queued for background processing"},
+        400: {"description": "Invalid or unreadable PDF"},
+        413: {"description": "Uploaded file too large"},
+    },
+)
 async def process_pdf(
     file: UploadFile = File(...),
     dpi: int = Form(400, ge=72, le=1200),
@@ -243,11 +274,14 @@ async def process_pdf(
     )
 
     if async_mode:
-        return {
-            "job_id": job_id,
-            "status": "queued",
-            "message": "PDF uploaded successfully. Queued for processing.",
-        }
+        return JSONResponse(
+            status_code=202,
+            content={
+                "job_id": job_id,
+                "status": "queued",
+                "message": "PDF uploaded successfully. Queued for processing.",
+            },
+        )
 
     # Process synchronously off the event loop so the server stays responsive.
     job = job_store.get_job(job_id)
@@ -257,14 +291,22 @@ async def process_pdf(
 
     job = job_store.get_job(job_id) or {}
     status = job.get("status", "failed")
+    if status == "cancelled":
+        raise HTTPException(
+            status_code=409, detail=f"Job {job_id} was cancelled"
+        )
+    if status != "completed":
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"OCR processing failed for job {job_id}: "
+                f"{job.get('error', 'unknown error')}"
+            ),
+        )
     return {
         "job_id": job_id,
         "status": status,
-        "message": (
-            "OCR processing completed successfully"
-            if status == "completed"
-            else f"Processing failed: {job.get('error')}"
-        ),
+        "message": "OCR processing completed successfully",
     }
 
 
@@ -311,10 +353,7 @@ async def get_text_output(job_id: str):
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
     if job["status"] != "completed":
-        raise HTTPException(
-            status_code=400,
-            detail=f"Job status: {job['status']}. Results not available yet.",
-        )
+        raise _results_not_ready(job)
 
     text_file = job["files"].get("text")
     if not text_file or not os.path.exists(text_file):
@@ -332,10 +371,7 @@ async def get_json_output(job_id: str):
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
     if job["status"] != "completed":
-        raise HTTPException(
-            status_code=400,
-            detail=f"Job status: {job['status']}. Results not available yet.",
-        )
+        raise _results_not_ready(job)
 
     json_file = job["files"].get("json")
     if not json_file or not os.path.exists(json_file):
@@ -355,10 +391,7 @@ async def get_review_report(job_id: str):
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
     if job["status"] != "completed":
-        raise HTTPException(
-            status_code=400,
-            detail=f"Job status: {job['status']}. Results not available yet.",
-        )
+        raise _results_not_ready(job)
 
     review_file = job["files"].get("review")
     if not review_file or not os.path.exists(review_file):
@@ -387,13 +420,9 @@ async def get_results_summary(job_id: str, include_partial: bool = False):
 
     # Allow partial results if requested
     if not include_partial and job["status"] != "completed":
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Job status: {job['status']}. Results not available yet. "
-                "Use ?include_partial=true to get partial results."
-            ),
-        )
+        error = _results_not_ready(job)
+        error.detail += " Use ?include_partial=true to get partial results."
+        raise error
 
     results = job_store.get_page_results(job_id)
     pages_total = job["pages_total"]
@@ -437,11 +466,16 @@ async def cancel_job(job_id: str):
     if not job_store.cancel_job(job_id):
         raise HTTPException(status_code=409, detail="Job could not be cancelled")
 
-    return {
-        "job_id": job_id,
-        "status": "cancelled",
-        "message": "Job cancelled. A page already being processed may finish first.",
-    }
+    return JSONResponse(
+        status_code=202,
+        content={
+            "job_id": job_id,
+            "status": "cancelled",
+            "message": (
+                "Job cancelled. A page already being processed may finish first."
+            ),
+        },
+    )
 
 
 @app.delete("/ocr/{job_id}")
