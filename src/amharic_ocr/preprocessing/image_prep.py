@@ -5,6 +5,8 @@ Image preprocessing routines for Amharic text and Ethiopic numeral OCR.
 import cv2
 import numpy as np
 
+from .page_analysis import estimate_skew
+
 
 def to_grayscale(image: np.ndarray) -> np.ndarray:
     """Helper to convert BGR/RGB to Grayscale."""
@@ -13,19 +15,99 @@ def to_grayscale(image: np.ndarray) -> np.ndarray:
     return image.copy()
 
 
+def normalize_background(image: np.ndarray) -> np.ndarray:
+    """
+    Flat-field background illumination normalization.
+    Compensates for uneven lighting, shadows across book spine, and yellowed paper.
+    Uses morphological dilation to estimate background and normalizes against it.
+    """
+    gray = to_grayscale(image)
+    # 51x51 kernel captures slow background illumination changes without capturing text glyphs
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (51, 51))
+    dilated = cv2.morphologyEx(gray, cv2.MORPH_DILATE, kernel)
+    norm = cv2.divide(gray, dilated, scale=255)
+    return norm
+
+
+def apply_clahe(image: np.ndarray, clip_limit: float = 2.0, tile_grid_size: tuple[int, int] = (8, 8)) -> np.ndarray:
+    """
+    Contrast Limited Adaptive Histogram Equalization.
+    Enhances faint Fidel characters on faded or aged paper.
+    """
+    gray = to_grayscale(image)
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size)
+    return clahe.apply(gray)
+
+
+def crop_to_text_content(image: np.ndarray, padding_ratio: float = 0.02) -> np.ndarray:
+    """
+    Content-aware text block detection and margin cropping.
+
+    .. warning::
+       Cropping can delete marginalia, footnotes, page numbers, or text that
+       touches an edge. It is opt-in (``--crop``) and every crop is recorded
+       in the per-page diagnostics. The untouched page is still retained.
+    """
+    gray = to_grayscale(image)
+    h, w = gray.shape[:2]
+
+    # Otsu thresholding inverted (text foreground is white)
+    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    # Dynamic kernel size proportional to image dimensions
+    k_w = max(int(w * 0.02), 15)
+    k_h = max(int(h * 0.01), 10)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k_w, k_h))
+    dilated = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+
+    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return image
+
+    min_x, min_y = w, h
+    max_x, max_y = 0, 0
+    min_area = (w * h) * 0.0005  # Filter out tiny speckles/dust
+
+    found_content = False
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area > min_area:
+            x, y, cw, ch = cv2.boundingRect(cnt)
+            # Skip outer boundary frames that span almost the entire image
+            if cw > w * 0.98 and ch > h * 0.98:
+                continue
+            min_x = min(min_x, x)
+            min_y = min(min_y, y)
+            max_x = max(max_x, x + cw)
+            max_y = max(max_y, y + ch)
+            found_content = True
+
+    if not found_content or min_x >= max_x or min_y >= max_y:
+        return image
+
+    pad_x = int(w * padding_ratio)
+    pad_y = int(h * padding_ratio)
+
+    x1 = max(0, min_x - pad_x)
+    y1 = max(0, min_y - pad_y)
+    x2 = min(w, max_x + pad_x)
+    y2 = min(h, max_y + pad_y)
+
+    return image[y1:y2, x1:x2]
+
+
 def remove_binding_shadow(image: np.ndarray) -> np.ndarray:
     """
     Detect and crop the dark vertical band produced by book spine binding.
 
-    Scanned books have a dark shadow along the binding edge (left or right)
-    that Tesseract misreads as pipe characters '|' and random Latin glyphs.
-    This function:
-    1. Profiles mean brightness per column in the left and right 20% margins.
-    2. Finds the outermost contiguous run of very dark columns (mean < 80).
-    3. Crops past the shadow, adding a small padding so no text is lost.
+    .. warning::
+       This is destructive and is **not** used by default. It assumes the
+       darkest outer columns are binding shadow, which is not always true for
+       dark covers, edge annotations, or text that reaches the page edge.
+       Enable with ``--remove-shadow`` and inspect the recorded crop.
     """
     gray = to_grayscale(image)
-    h, w = gray.shape[:2]
+    w = gray.shape[1]
 
     # Per-column mean brightness
     col_means = np.mean(gray, axis=0)
@@ -61,16 +143,13 @@ def remove_scan_artifacts(image: np.ndarray) -> np.ndarray:
     """
     Remove common scanner artifacts from the image margins.
 
-    Handles:
-    - CamScanner / scanner-app watermark text at the very bottom
-    - Thin border lines at page edges (frame borders)
-
-    The bottom 8% of the image is inspected; if it is mostly empty
-    (high mean brightness) it is trimmed so that the watermark text
-    does not pollute OCR output.
+    .. warning::
+       Trimming the bottom 8% can delete footnotes or page numbers. This is
+       opt-in (``--trim-edges``) and is recorded in diagnostics; it is never
+       applied silently by the default workflow.
     """
     gray = to_grayscale(image)
-    h, w = gray.shape[:2]
+    h = gray.shape[0]
 
     # Inspect the bottom 8% for watermark / whitespace
     bottom_start = int(h * 0.92)
@@ -84,35 +163,53 @@ def remove_scan_artifacts(image: np.ndarray) -> np.ndarray:
     return image
 
 
-def deskew(image: np.ndarray) -> np.ndarray:
+def deskew_with_info(
+    image: np.ndarray,
+    max_angle: float = 10.0,
+    enabled: bool = True,
+) -> tuple[np.ndarray, dict]:
+    """
+    Deskew an image and return both the result and the decision.
+
+    The rotation is skipped when the angle is negligible, unreliable, or
+    larger than ``max_angle``. This avoids silently applying a bad estimate
+    to a page that may simply be rotated or have a strong border.
+    """
+    info = estimate_skew(image, max_angle=max_angle)
+    info["enabled"] = enabled
+    info["applied"] = False
+
+    if not enabled:
+        info["notes"].append("Deskew disabled by configuration.")
+        return image, info
+    if not info["reliable"]:
+        info["notes"].append("Deskew skipped because the estimate was not reliable.")
+        return image, info
+
+    angle = float(info["angle_deg"])
+    h, w = image.shape[:2]
+    center = (w // 2, h // 2)
+    matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
+    rotated = cv2.warpAffine(
+        image,
+        matrix,
+        (w, h),
+        flags=cv2.INTER_CUBIC,
+        borderMode=cv2.BORDER_REPLICATE,
+    )
+    info["applied"] = True
+    info["applied_angle_deg"] = angle
+    return rotated, info
+
+
+def deskew(image: np.ndarray, max_angle: float = 20.0) -> np.ndarray:
     """
     Fix image skew/rotation for better OCR alignment.
-    Expects grayscale or BGR/RGB image.
+
+    Backwards-compatible wrapper around :func:`deskew_with_info`. New code
+    should use ``deskew_with_info`` so the decision can be recorded.
     """
-    gray = to_grayscale(image)
-    # Threshold to binary for minAreaRect to detect text orientation
-    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    
-    coords = np.column_stack(np.where(thresh > 0))
-    if len(coords) == 0:
-        return image
-        
-    angle = cv2.minAreaRect(coords)[-1]
-    
-    # minAreaRect returns angle in range [-90, 0)
-    if angle < -45:
-        angle = -(90 + angle)
-    else:
-        angle = -angle
-        
-    # Only deskew if rotation angle is reasonable (avoids 90 degree flip)
-    if abs(angle) > 20:
-        return image
-        
-    (h, w) = image.shape[:2]
-    center = (w // 2, h // 2)
-    M = cv2.getRotationMatrix2D(center, angle, 1.0)
-    rotated = cv2.warpAffine(image, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+    rotated, _ = deskew_with_info(image, max_angle=max_angle)
     return rotated
 
 def sauvola_threshold(image: np.ndarray, window_size: int = 15, k: float = 0.2, R: float = 128.0) -> np.ndarray:
@@ -181,11 +278,13 @@ def preprocess_for_numerals(image: np.ndarray, use_sauvola: bool = False) -> np.
     
     return binary
 
-def preprocess_for_text(image: np.ndarray, use_sauvola: bool = False) -> np.ndarray:
+def preprocess_for_text(image: np.ndarray, use_sauvola: bool = False, enhance_contrast: bool = True) -> np.ndarray:
     """
     Standard preprocessing for Amharic text:
     - Grayscale conversion
+    - Flat-field illumination normalization (removes page yellowing / dark shadows)
     - Median blur denoising (kernel=3 to preserve fine Fidel stroke variations)
+    - Contrast enhancement (CLAHE)
     - Otsu thresholding or Sauvola local thresholding
     """
     gray = to_grayscale(image)
@@ -195,10 +294,16 @@ def preprocess_for_text(image: np.ndarray, use_sauvola: bool = False) -> np.ndar
         scale = 100 / min(gray.shape)
         gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
 
+    # Normalize background illumination surface to level lighting gradients
+    normalized = normalize_background(gray)
+
     # Use a 3×3 kernel instead of 5×5: Fidel order-mark hooks (e.g. ሰ→ሶ) differ
     # by just a few pixels; a 5-pixel blur erases them and collapses entire
     # character columns into the same glyph.
-    denoised = cv2.medianBlur(gray, 3)
+    denoised = cv2.medianBlur(normalized, 3)
+
+    if enhance_contrast:
+        denoised = apply_clahe(denoised, clip_limit=2.0)
 
     if use_sauvola:
         binary = sauvola_threshold(denoised)

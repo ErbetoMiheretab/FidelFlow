@@ -1,5 +1,5 @@
 """
-Post-processing and error corrections.
+Post-processing and conservative corrections.
 """
 
 from .corrections import (
@@ -9,7 +9,9 @@ from .corrections import (
     correct_visual_confusions,
     deduplicate_numeral_loops,
     extract_ethiopic_numerals,
+    find_suspicious_numeral_runs,
     post_process_text,
+    post_process_text_with_report,
 )
 
 __all__ = [
@@ -19,5 +21,7 @@ __all__ = [
     "correct_visual_confusions",
     "deduplicate_numeral_loops",
     "extract_ethiopic_numerals",
+    "find_suspicious_numeral_runs",
     "post_process_text",
+    "post_process_text_with_report",
 ]

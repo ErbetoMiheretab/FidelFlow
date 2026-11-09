@@ -63,11 +63,13 @@ LATIN_CHARS = "0123456789 .,;:!?()[]{}-'\"\\\n"
 # Combined extra characters allowed in the mixed-content whitelist
 ALLOWED_EXTRA_CHARS = LATIN_CHARS + ETHIOPIC_PUNCTUATION
 
-# Visually-ambiguous Ethiopic OCR confusions (safe to correct globally)
-# NOTE: ፣ (Ethiopic comma) is intentionally NOT mapped here — it is a valid
-# punctuation mark in real Amharic text and must not be silently converted to ፫.
+# Visually-ambiguous Ethiopic character confusions.
+# IMPORTANT: ፨ (paragraph separator) is valid Ethiopic punctuation. It is only
+# treated as a misread ፰ when it appears next to a genuine Ethiopic numeral;
+# see correct_visual_confusions() in corrections.py. The mapping must not be
+# applied globally.
 VISUAL_CONFUSIONS = {
-    '፨': '፰',   # Ethiopic paragraph separator confused with 8 (፰) — rare in body text
+    '፨': '፰',   # Ethiopic paragraph separator / numeral 8 — contextual only
 }
 
 # Latin characters frequently misrecognized instead of Ethiopic numerals.
