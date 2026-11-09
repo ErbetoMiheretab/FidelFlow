@@ -18,7 +18,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from starlette.concurrency import run_in_threadpool
 
@@ -39,6 +39,11 @@ RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 JOBS_DB = Path(os.getenv("OCR_JOBS_DB", str(RESULTS_DIR / "jobs.db")))
 job_store = JobStore(JOBS_DB)
 
+# Upload limits. Both are configurable for deployments with larger books.
+MAX_UPLOAD_BYTES = int(os.getenv("OCR_MAX_UPLOAD_BYTES", str(200 * 1024 * 1024)))
+MAX_PAGES = int(os.getenv("OCR_MAX_PAGES", "2000"))
+UPLOAD_CHUNK_SIZE = 1024 * 1024
+
 
 @asynccontextmanager
 async def lifespan(application: FastAPI):
@@ -58,6 +63,13 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+
+
+def _safe_filename(filename: str | None) -> str:
+    """Return a display filename with path components and control chars removed."""
+    name = (filename or "").replace("\\", "/").rsplit("/", 1)[-1].strip()
+    name = "".join(char for char in name if char >= " " and char != "\x7f")
+    return name[:255] or "upload.pdf"
 
 
 def _job_storage_paths(job_id: str, job: dict[str, Any]) -> tuple[Path, Path]:
@@ -111,18 +123,18 @@ async def diagnostics():
         diagnostics_output = get_system_diagnostics()
         return {"status": "success", "diagnostics": diagnostics_output}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Diagnostics failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Diagnostics failed: {e!s}")
 
 
 @app.post("/ocr")
 async def process_pdf(
     file: UploadFile = File(...),
-    dpi: int = 400,
-    split_pages: bool = False,
-    use_easyocr: bool = False,
-    gpu: bool = False,
-    min_char_threshold: int = 50,
-    async_mode: bool = True,
+    dpi: int = Form(400, ge=72, le=1200),
+    split_pages: bool = Form(False),
+    use_easyocr: bool = Form(False),
+    gpu: bool = Form(False),
+    min_char_threshold: int = Form(50, ge=0, le=1_000_000),
+    async_mode: bool = Form(True),
 ):
     """
     Upload a PDF file for OCR processing.
@@ -139,32 +151,76 @@ async def process_pdf(
     Returns:
         Job ID for tracking processing status
     """
-    filename = file.filename or "upload.pdf"
+    filename = _safe_filename(file.filename)
     if not filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported")
 
     # Generate unique job ID
     job_id = str(uuid.uuid4())
 
-    # Save uploaded file
+    # Stream the upload to disk with a hard size limit so a large request
+    # cannot exhaust memory. Keep the first kilobyte for a signature check.
     pdf_path = UPLOAD_DIR / f"{job_id}.pdf"
+    size = 0
+    header = b""
     try:
-        content = await file.read()
         with open(pdf_path, "wb") as f:
-            f.write(content)
+            while chunk := await file.read(UPLOAD_CHUNK_SIZE):
+                size += len(chunk)
+                if size > MAX_UPLOAD_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=(
+                            f"Uploaded file exceeds the {MAX_UPLOAD_BYTES} byte "
+                            "limit (OCR_MAX_UPLOAD_BYTES)."
+                        ),
+                    )
+                if len(header) < 1024:
+                    header += chunk[: 1024 - len(header)]
+                f.write(chunk)
+    except HTTPException:
+        pdf_path.unlink(missing_ok=True)
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to save file: {str(e)}")
+        pdf_path.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=500, detail=f"Failed to save file: {e!s}"
+        ) from e
+
+    if size == 0:
+        pdf_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+    if b"%PDF-" not in header:
+        pdf_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="File is not a valid PDF")
+
+    # Read the page count up front so progress is meaningful before the first
+    # page finishes. Reject unreadable or unreasonably large documents now
+    # instead of queuing a job that cannot succeed.
+    try:
+        pages_total = get_page_count(str(pdf_path))
+    except Exception as e:
+        pdf_path.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=400, detail=f"Could not read PDF: {e!s}"
+        ) from e
+
+    if pages_total < 1:
+        pdf_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="PDF contains no pages")
+    if pages_total > MAX_PAGES:
+        pdf_path.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"PDF has {pages_total} pages; the maximum is {MAX_PAGES} "
+                "(OCR_MAX_PAGES)."
+            ),
+        )
 
     # Create output directory for this job
     output_dir = RESULTS_DIR / job_id
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Read the page count up front so progress is meaningful before the first
-    # page finishes. A failure here is not fatal; the pipeline will report it.
-    try:
-        pages_total: int | None = get_page_count(str(pdf_path))
-    except Exception:  # noqa: BLE001
-        pages_total = None
 
     config = OCRConfig(
         dpi=dpi,
