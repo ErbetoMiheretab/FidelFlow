@@ -18,7 +18,7 @@ from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 
 from amharic_ocr.config import OCRConfig
-from amharic_ocr.diagnostics import check_system_setup
+from amharic_ocr.diagnostics import get_system_diagnostics
 from amharic_ocr.pipeline import run_pipeline
 
 app = FastAPI(
@@ -64,9 +64,9 @@ async def health_check():
 
 @app.get("/diagnostics")
 async def diagnostics():
-    """Run system diagnostics to verify OCR dependencies."""
+    """Report environment and OCR engine/model capabilities."""
     try:
-        diagnostics_output = check_system_setup()
+        diagnostics_output = get_system_diagnostics()
         return {"status": "success", "diagnostics": diagnostics_output}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Diagnostics failed: {str(e)}")

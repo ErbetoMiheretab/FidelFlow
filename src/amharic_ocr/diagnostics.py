@@ -88,6 +88,29 @@ def test_numeral_recognition() -> str:
     return result.text
 
 
+def get_system_diagnostics() -> dict:
+    """Return environment and engine capability information as structured data.
+
+    Unlike :func:`check_system_setup`, this does not print to stdout and does
+    not run the synthetic numeral OCR test, so it is safe to call from an API
+    request.
+    """
+    diagnostics: dict = {
+        "python_version": sys.version.splitlines()[0],
+        "opencv_version": cv2.__version__,
+        "pymupdf_version": None,
+        "tessdata_prefix": os.environ.get("TESSDATA_PREFIX", ""),
+        "engines": check_engine_capabilities(),
+    }
+    try:
+        import fitz
+
+        diagnostics["pymupdf_version"] = getattr(fitz, "__version__", "installed")
+    except ImportError:
+        pass
+    return diagnostics
+
+
 def check_system_setup():
     """Run full environment diagnostics."""
     print("=" * 60)
