@@ -462,8 +462,15 @@ def run_pipeline(
     pdf_path: str,
     config: OCRConfig | None = None,
     status_callback: Callable[[int, int], None] | None = None,
+    result_callback: Callable[[list[dict[str, Any]], int, int], None] | None = None,
 ) -> list[dict[str, Any]]:
-    """Main entry point for running the extraction pipeline on a PDF file."""
+    """Main entry point for running the extraction pipeline on a PDF file.
+
+    ``status_callback(pages_done, pages_total)`` is called after each PDF page.
+    ``result_callback(page_results, pages_done, pages_total)`` additionally
+    receives the results for that page, so callers can expose partial output
+    while the job is still running.
+    """
     if config is None:
         config = OCRConfig()
 
@@ -516,6 +523,10 @@ def run_pipeline(
                 f"Raw length: {len(r.get('raw_text', ''))} | "
                 f"Numerals found: {r['numerals_found']}"
             )
+        if result_callback:
+            result_callback(page_results, 1, num_pages)
+        if status_callback:
+            status_callback(1, num_pages)
     else:
         with mp.Pool(processes=max_workers) as pool:
             for idx, page_results in enumerate(pool.imap(process_single_page, tasks)):
@@ -527,6 +538,8 @@ def run_pipeline(
                         f"{len(r.get('raw_text', ''))} | "
                         f"Numerals found: {r['numerals_found']}"
                     )
+                if result_callback:
+                    result_callback(page_results, idx + 1, num_pages)
                 if status_callback:
                     status_callback(idx + 1, num_pages)
 
