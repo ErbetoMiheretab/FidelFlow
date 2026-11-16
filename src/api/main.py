@@ -10,26 +10,40 @@ This API provides endpoints to:
 """
 
 import os
+import re
 import shutil
+import tempfile
 import threading
 import uuid
+import zipfile
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+import cv2
+from fastapi import (
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    UploadFile,
+)
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
+from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 
 from amharic_ocr.config import OCRConfig
 from amharic_ocr.diagnostics import get_system_diagnostics
-from amharic_ocr.io.pdf_reader import get_page_count
+from amharic_ocr.io.pdf_reader import get_page_count, render_page_to_numpy
 
 from .job_store import TERMINAL_STATUSES, JobStore
-from .worker import JobWorker, run_job
+from .worker import JobWorker, output_file_paths, run_job
 
 # Directories for storing uploaded PDFs and results
 UPLOAD_DIR = Path(os.getenv("OCR_UPLOAD_DIR", "uploads"))
@@ -45,6 +59,8 @@ job_store = JobStore(JOBS_DB)
 MAX_UPLOAD_BYTES = int(os.getenv("OCR_MAX_UPLOAD_BYTES", str(200 * 1024 * 1024)))
 MAX_PAGES = int(os.getenv("OCR_MAX_PAGES", "2000"))
 UPLOAD_CHUNK_SIZE = 1024 * 1024
+
+JobStatus = Literal["queued", "processing", "completed", "failed", "cancelled"]
 
 
 @asynccontextmanager
@@ -89,6 +105,40 @@ def _results_not_ready(job: dict[str, Any]) -> HTTPException:
     return HTTPException(status_code=409, detail=detail)
 
 
+def _page_summary(result: dict[str, Any]) -> dict[str, Any]:
+    """Return the compact representation used by result listings."""
+    return {
+        "page": result["page"],
+        "text_length": len(result.get("text", "")),
+        "raw_text_length": len(result.get("raw_text", "")),
+        "confidence": result.get("confidence", 0.0),
+        "engine": result.get("engine_name", "unknown"),
+        "numeral_heavy": bool(result.get("numeral_heavy", False)),
+        "numerals_found": result.get("numerals_found", []),
+        "flagged": bool(result.get("flagged", False)),
+        "review_reasons": result.get("review_reasons", []),
+        "warnings": result.get("warnings", []),
+    }
+
+
+def _page_number(page_id: str) -> int | None:
+    """Extract the PDF page number from a page id such as ``12`` or ``12a``."""
+    match = re.match(r"^(\d+)", page_id)
+    return int(match.group(1)) if match else None
+
+
+def _build_archive(output_dir: Path) -> Path:
+    """Create a temporary ZIP containing every file in an output directory."""
+    fd, name = tempfile.mkstemp(prefix="ocr-", suffix=".zip")
+    os.close(fd)
+    archive_path = Path(name)
+    with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as archive:
+        for path in sorted(output_dir.rglob("*")):
+            if path.is_file():
+                archive.write(path, path.relative_to(output_dir))
+    return archive_path
+
+
 def _safe_filename(filename: str | None) -> str:
     """Return a display filename with path components and control chars removed."""
     name = (filename or "").replace("\\", "/").rsplit("/", 1)[-1].strip()
@@ -121,11 +171,17 @@ async def root():
         "description": "OCR service for Amharic text with Ethiopic numeral recognition",
         "endpoints": {
             "POST /ocr": "Upload PDF for OCR processing",
+            "GET /ocr": "List jobs with filtering and pagination",
             "GET /ocr/{job_id}/status": "Get processing status",
             "GET /ocr/{job_id}/results": "Get page-level results summary",
+            "GET /ocr/{job_id}/pages": "List page results",
+            "GET /ocr/{job_id}/pages/{page_id}": "Get one full page result",
+            "GET /ocr/{job_id}/pages/{page_id}/image": "Render one page image",
             "GET /ocr/{job_id}/text": "Get plain text output",
+            "GET /ocr/{job_id}/raw": "Get raw pre-correction text",
             "GET /ocr/{job_id}/json": "Get structured JSON output",
             "GET /ocr/{job_id}/review": "Get quality review report",
+            "GET /ocr/{job_id}/archive": "Download all outputs as a ZIP",
             "POST /ocr/{job_id}/cancel": "Cancel a queued or running job",
             "DELETE /ocr/{job_id}": "Delete a job and its files",
             "GET /health": "Health check",
@@ -310,6 +366,48 @@ async def process_pdf(
     }
 
 
+@app.get("/ocr")
+async def list_jobs(
+    status: JobStatus | None = Query(None, description="Filter by job status"),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    """List jobs, newest first, with progress and result counts."""
+    jobs = job_store.list_jobs(status=status, limit=limit, offset=offset)
+    total = job_store.count_jobs(status=status)
+
+    items: list[dict[str, Any]] = []
+    for job in jobs:
+        item: dict[str, Any] = {
+            "job_id": job["job_id"],
+            "status": job["status"],
+            "filename": job["filename"],
+            "pages_processed": job["pages_processed"],
+            "pages_total": job["pages_total"],
+            "result_segments": job["result_segments"],
+            "total_numerals": job["total_numerals"],
+            "created_at": job["created_at"],
+            "updated_at": job["updated_at"],
+        }
+        if job["pages_total"]:
+            item["progress_percent"] = round(
+                min(job["pages_processed"], job["pages_total"])
+                / job["pages_total"]
+                * 100,
+                1,
+            )
+        if job.get("error"):
+            item["error"] = job["error"]
+        items.append(item)
+
+    return {
+        "jobs": items,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
+
+
 @app.get("/ocr/{job_id}/status")
 async def get_job_status(job_id: str):
     """Get the status and progress of an OCR job."""
@@ -434,19 +532,147 @@ async def get_results_summary(job_id: str, include_partial: bool = False):
             "total_pages": pages_total if pages_total is not None else len(results),
             "pages_processed": job["pages_processed"],
             "result_segments": len(results),
-            "pages": [
-                {
-                    "page": r["page"],
-                    "text_length": len(r["text"]),
-                    "confidence": r["confidence"],
-                    "engine": r["engine_name"],
-                    "numerals_found": r["numerals_found"],
-                    "flagged": r["flagged"],
-                    "review_reasons": r["review_reasons"],
-                }
-                for r in results
-            ],
+            "pages": [_page_summary(result) for result in results],
         }
+    )
+
+
+@app.get("/ocr/{job_id}/raw")
+async def get_raw_output(job_id: str):
+    """Get the raw OCR text before corrections."""
+    job = job_store.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job["status"] != "completed":
+        raise _results_not_ready(job)
+
+    raw_file = job["files"].get("raw") or output_file_paths(
+        job["output_dir"], job["pdf_path"]
+    )["raw"]
+    if not os.path.exists(raw_file):
+        raise HTTPException(status_code=404, detail="Raw output file not found")
+
+    return FileResponse(
+        raw_file, media_type="text/plain", filename=f"{job['filename']}_raw.txt"
+    )
+
+
+@app.get("/ocr/{job_id}/pages")
+async def list_pages(
+    job_id: str,
+    include_partial: bool = False,
+    flagged: bool | None = None,
+    numeral_heavy: bool | None = None,
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+):
+    """List page-level results with optional filtering and pagination."""
+    job = job_store.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if not include_partial and job["status"] != "completed":
+        raise _results_not_ready(job)
+
+    results = job_store.get_page_results(job_id)
+    filtered = [
+        result
+        for result in results
+        if (flagged is None or bool(result.get("flagged")) == flagged)
+        and (
+            numeral_heavy is None
+            or bool(result.get("numeral_heavy")) == numeral_heavy
+        )
+    ]
+    window = filtered[offset : offset + limit]
+
+    return {
+        "job_id": job_id,
+        "status": job["status"],
+        "total": len(filtered),
+        "result_segments": len(results),
+        "limit": limit,
+        "offset": offset,
+        "pages": [_page_summary(result) for result in window],
+    }
+
+
+@app.get("/ocr/{job_id}/pages/{page_id}")
+async def get_page(job_id: str, page_id: str):
+    """Get the full result for a single page, including diagnostics."""
+    job = job_store.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    result = job_store.get_page_result(job_id, page_id)
+    if result is None:
+        raise HTTPException(
+            status_code=404, detail=f"Page {page_id!r} not found for this job"
+        )
+
+    return {"job_id": job_id, "status": job["status"], "page": result}
+
+
+@app.get("/ocr/{job_id}/pages/{page_id}/image")
+async def get_page_image(job_id: str, page_id: str):
+    """Render the source PDF page for a page id (``12`` or split ``12a``/``12b``)."""
+    job = job_store.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    page_number = _page_number(page_id)
+    if page_number is None or page_number < 1:
+        raise HTTPException(
+            status_code=404, detail=f"Page {page_id!r} has no PDF page number"
+        )
+    if job["pages_total"] and page_number > job["pages_total"]:
+        raise HTTPException(status_code=404, detail="Page out of range")
+
+    pdf_path = Path(job["pdf_path"])
+    if not pdf_path.is_file():
+        raise HTTPException(status_code=404, detail="Source PDF not found")
+
+    dpi = int(job["config"].get("dpi", 400))
+    try:
+        image = await run_in_threadpool(
+            render_page_to_numpy, str(pdf_path), page_number, dpi
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Could not render page image: {e!s}"
+        ) from e
+
+    success, encoded = cv2.imencode(".png", image)
+    if not success:
+        raise HTTPException(status_code=500, detail="Could not encode page image")
+
+    return Response(content=encoded.tobytes(), media_type="image/png")
+
+
+@app.get("/ocr/{job_id}/archive")
+async def get_archive(job_id: str):
+    """Download every output file for a completed job as a ZIP archive."""
+    job = job_store.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job["status"] != "completed":
+        raise _results_not_ready(job)
+
+    _, output_dir = _job_storage_paths(job_id, job)
+    if not output_dir.is_dir():
+        raise HTTPException(status_code=404, detail="Output directory not found")
+
+    try:
+        archive_path = await run_in_threadpool(_build_archive, output_dir)
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Could not create archive: {e!s}"
+        ) from e
+
+    return FileResponse(
+        archive_path,
+        media_type="application/zip",
+        filename=f"{Path(job['filename']).stem}_ocr.zip",
+        background=BackgroundTask(archive_path.unlink, missing_ok=True),
     )
 
 

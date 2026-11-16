@@ -144,6 +144,15 @@ class JobStore:
                 jobs.append(job)
         return jobs
 
+    def count_jobs(self, status: str | None = None) -> int:
+        query = "SELECT COUNT(*) FROM jobs"
+        params: list[Any] = []
+        if status:
+            query += " WHERE status = ?"
+            params.append(status)
+        with closing(self._connect()) as conn:
+            return int(conn.execute(query, params).fetchone()[0])
+
     def update_status(
         self, job_id: str, status: str, error: str | None = None
     ) -> None:
@@ -303,3 +312,14 @@ class JobStore:
                 (job_id,),
             ).fetchall()
         return [json.loads(row["result_json"]) for row in rows]
+
+    def get_page_result(
+        self, job_id: str, page_key: str
+    ) -> dict[str, Any] | None:
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT result_json FROM job_pages "
+                "WHERE job_id = ? AND page_key = ? ORDER BY seq LIMIT 1",
+                (job_id, page_key),
+            ).fetchone()
+        return json.loads(row["result_json"]) if row is not None else None
