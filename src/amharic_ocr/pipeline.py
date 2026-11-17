@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import multiprocessing as mp
 import os
+import re
 from collections.abc import Callable
 from typing import Any
 
@@ -550,6 +551,30 @@ def run_pipeline(
     )
     save_json_output(all_results, json_out)
     generate_review_report(all_results, report_out)
+
+    if config.render_pdf or config.render_epub:
+        from books.renderer import BookRenderer
+        from books.template import BookTemplate, derive_metadata_from_filename
+
+        auto_title, auto_author = derive_metadata_from_filename(os.path.basename(pdf_path))
+        template = BookTemplate(
+            title=config.book_title or auto_title,
+            author=config.book_author or auto_author,
+        )
+        renderer = BookRenderer(template)
+        os.makedirs(config.rendered_dir, exist_ok=True)
+        slug = re.sub(r"[^\w\s-]", "", template.title).strip()
+        slug = re.sub(r"[\s-]+", "_", slug) or "book"
+
+        if config.render_pdf:
+            pdf_rendered_out = os.path.join(config.rendered_dir, f"{slug}.pdf")
+            renderer.render_pdf(all_results, pdf_rendered_out)
+            print(f"📖 Rendered Novel PDF: {pdf_rendered_out}")
+
+        if config.render_epub:
+            epub_rendered_out = os.path.join(config.rendered_dir, f"{slug}.epub")
+            renderer.render_epub(all_results, epub_rendered_out)
+            print(f"📗 Rendered EPUB: {epub_rendered_out}")
 
     total_numerals = sum(len(r["numerals_found"]) for r in all_results)
     flagged = sum(1 for r in all_results if r.get("flagged"))

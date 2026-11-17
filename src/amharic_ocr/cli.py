@@ -51,6 +51,11 @@ def _build_config(args) -> OCRConfig:
         deduplicate_numeral_runs=args.deduplicate_numerals,
         clean_margin_artifacts=not args.no_clean_margin,
         strip_margin_noise_edges=args.strip_margin_edges,
+        render_pdf=args.render_pdf,
+        render_epub=args.render_epub,
+        rendered_dir=args.rendered_dir,
+        book_title=args.title or None,
+        book_author=args.author or None,
     )
 
 
@@ -231,6 +236,32 @@ def main():
         type=int,
         default=50,
         help="Minimum character threshold for review flagging (default: 50)",
+    )
+    render_group = parser.add_argument_group("Rendered book output (PDF / EPUB)")
+    render_group.add_argument(
+        "--render-pdf",
+        action="store_true",
+        help="Render OCR output into a formatted standard novel PDF",
+    )
+    render_group.add_argument(
+        "--render-epub",
+        action="store_true",
+        help="Render OCR output into a formatted EPUB e-book",
+    )
+    render_group.add_argument(
+        "--rendered-dir",
+        default="rendered",
+        help="Directory to save rendered books (default: rendered)",
+    )
+    render_group.add_argument(
+        "--title",
+        default="",
+        help="Book title override (default: auto-detected from filename)",
+    )
+    render_group.add_argument(
+        "--author",
+        default="",
+        help="Book author override (default: auto-detected from filename)",
     )
     parser.add_argument(
         "--diagnose",

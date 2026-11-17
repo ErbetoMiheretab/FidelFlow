@@ -88,3 +88,10 @@ class OCRConfig:
     # Kept for backwards compatibility. When true, the "local" variant is
     # guaranteed to be included even if the user supplied a custom list.
     use_sauvola: bool = False
+
+    # Rendered book options (PDF and EPUB formatted novel output)
+    render_pdf: bool = False
+    render_epub: bool = False
+    rendered_dir: str = "rendered"
+    book_title: str | None = None
+    book_author: str | None = None
