@@ -11,6 +11,8 @@ import json
 import os
 import re
 import uuid
+import warnings
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
@@ -21,7 +23,13 @@ from books.template import (
     BookTemplate,
     derive_metadata_from_filename,
     find_default_ethiopic_font,
+    is_ethiopic,
+    validate_font_coverage,
 )
+
+# Chapter markers as they appear in the scanned Amharic corpus. "ምእራፍ" is a
+# common OCR variant of "ምዕራፍ".
+_HEADING_RE = re.compile(r"^ም[ዕእ]ራፍ\b")
 
 
 def _page_sort_key(page: Any) -> tuple[int, str]:
@@ -44,6 +52,338 @@ def _clean_ocr_text(text: str) -> str:
             continue
         cleaned_lines.append(line)
     return "\n".join(cleaned_lines).strip()
+
+
+@dataclass(frozen=True)
+class _Block:
+    """A reflowed paragraph or chapter heading."""
+
+    text: str
+    heading: bool = False
+
+
+def _reflow_blocks(text: str) -> list[_Block]:
+    """
+    Turn OCR lines into paragraphs.
+
+    OCR emits one line per visual line; treating each as a paragraph inserts a
+    blank line between every line of prose (and nearly doubles the page count).
+    Blank lines are the only paragraph separators; chapter markers start a new
+    block of their own.
+    """
+    blocks: list[_Block] = []
+    buffer: list[str] = []
+
+    def flush() -> None:
+        if buffer:
+            paragraph = " ".join(part.strip() for part in buffer if part.strip())
+            if paragraph:
+                blocks.append(_Block(text=re.sub(r"\s+", " ", paragraph)))
+            buffer.clear()
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            flush()
+            continue
+        if _HEADING_RE.match(line):
+            flush()
+            blocks.append(_Block(text=line, heading=True))
+            continue
+        buffer.append(line)
+
+    flush()
+    return blocks
+
+
+@dataclass(frozen=True)
+class _FontPair:
+    """An Ethiopic font plus its Latin companion (digits, punctuation)."""
+
+    ethiopic: fitz.Font
+    latin: fitz.Font
+    ascender: float
+    descender: float
+
+
+@dataclass(frozen=True)
+class _FontSet:
+    regular: _FontPair
+    bold: _FontPair
+
+
+def _load_font_pair(ethiopic_path: str, latin_path: str) -> _FontPair:
+    ethiopic = fitz.Font(fontfile=ethiopic_path)
+    latin = fitz.Font(fontfile=latin_path) if latin_path else ethiopic
+    return _FontPair(
+        ethiopic=ethiopic,
+        latin=latin,
+        ascender=max(ethiopic.ascender, latin.ascender),
+        descender=min(ethiopic.descender, latin.descender),
+    )
+
+
+def _load_fonts(template: BookTemplate) -> _FontSet:
+    regular = _load_font_pair(template.font_path, template.font_latin_path)
+    if template.font_bold_path:
+        bold_ethiopic = fitz.Font(fontfile=template.font_bold_path)
+        bold_latin_path = template.font_latin_bold_path
+        bold_latin = (
+            fitz.Font(fontfile=bold_latin_path) if bold_latin_path else bold_ethiopic
+        )
+        bold = _FontPair(
+            ethiopic=bold_ethiopic,
+            latin=bold_latin,
+            ascender=max(bold_ethiopic.ascender, bold_latin.ascender),
+            descender=min(bold_ethiopic.descender, bold_latin.descender),
+        )
+    else:
+        bold = regular
+    return _FontSet(regular=regular, bold=bold)
+
+
+def _iter_runs(text: str, pair: _FontPair) -> list[tuple[str, fitz.Font]]:
+    """Split text into contiguous runs that share one font."""
+    runs: list[list[Any]] = []
+    for char in text:
+        font = pair.ethiopic if is_ethiopic(char) else pair.latin
+        if runs and runs[-1][1] is font:
+            runs[-1][0] += char
+        else:
+            runs.append([char, font])
+    return [(str(chunk), font) for chunk, font in runs]
+
+
+def _text_width(text: str, pair: _FontPair, size: float) -> float:
+    return sum(font.text_length(chunk, size) for chunk, font in _iter_runs(text, pair))
+
+
+def _append_text(
+    writer: fitz.TextWriter,
+    x: float,
+    baseline: float,
+    text: str,
+    pair: _FontPair,
+    size: float,
+) -> float:
+    """Append a mixed-script string and return the new x position."""
+    cx = x
+    for chunk, font in _iter_runs(text, pair):
+        writer.append((cx, baseline), chunk, font, size)
+        cx += font.text_length(chunk, size)
+    return cx
+
+
+@dataclass
+class _Line:
+    words: list[str]
+    width: float
+    indent: float
+
+
+def _break_word(
+    word: str, pair: _FontPair, size: float, max_width: float
+) -> list[str]:
+    """Split a word that is wider than the column, character by character."""
+    if _text_width(word, pair, size) <= max_width or max_width <= 0:
+        return [word]
+    chunks: list[str] = []
+    current = ""
+    for char in word:
+        candidate = current + char
+        if current and _text_width(candidate, pair, size) > max_width:
+            chunks.append(current)
+            current = char
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return chunks or [word]
+
+
+def _wrap_paragraph(
+    text: str,
+    pair: _FontPair,
+    size: float,
+    width: float,
+    first_indent: float,
+) -> list[_Line]:
+    """Greedy line breaking with a first-line indent."""
+    words = text.split()
+    if not words:
+        return []
+
+    space_width = _text_width(" ", pair, size)
+    lines: list[_Line] = []
+    current: list[str] = []
+    current_width = 0.0
+    indent = first_indent
+    avail = max(width - indent, size * 2)
+
+    for word in words:
+        word_width = _text_width(word, pair, size)
+        needed = word_width if not current else current_width + space_width + word_width
+
+        if needed <= avail:
+            current.append(word)
+            current_width = needed
+            continue
+
+        if current:
+            lines.append(_Line(current, current_width, indent))
+            current, current_width = [], 0.0
+            indent, avail = 0.0, width
+
+        if word_width > avail:
+            chunks = _break_word(word, pair, size, avail)
+            for chunk in chunks[:-1]:
+                lines.append(_Line([chunk], _text_width(chunk, pair, size), indent))
+                indent = 0.0
+            current = [chunks[-1]]
+            current_width = _text_width(chunks[-1], pair, size)
+        else:
+            current, current_width = [word], word_width
+
+    if current:
+        lines.append(_Line(current, current_width, indent))
+    return lines
+
+
+def _line_baseline(pair: _FontPair, size: float, line_spacing: float, top: float) -> float:
+    """Baseline for a line box whose top edge is *top*."""
+    natural = (pair.ascender - pair.descender) * size
+    leading = max(0.0, size * line_spacing - natural)
+    return top + leading / 2 + pair.ascender * size
+
+
+class _PdfLayout:
+    """Paginates reflowed blocks into a warm-paper text PDF."""
+
+    def __init__(self, doc: fitz.Document, template: BookTemplate, fonts: _FontSet):
+        self.doc = doc
+        self.t = template
+        self.fonts = fonts
+        self.page: fitz.Page | None = None
+        self.writer: fitz.TextWriter | None = None
+        self.y = 0.0
+        self.toc: list[list[Any]] = []
+
+    # -- page lifecycle ---------------------------------------------------
+    def new_page(self, furniture: bool = True) -> None:
+        self.flush()
+        self.page = self.doc.new_page(
+            width=self.t.page_width_pt, height=self.t.page_height_pt
+        )
+        self.page.draw_rect(
+            self.page.rect, color=None, fill=self.t.page_bg_rgb, overlay=False
+        )
+        self.writer = fitz.TextWriter(self.page.rect)
+        self.y = self.t.margin_top_pt
+        if furniture:
+            self._draw_footer()
+            if self.t.include_running_header and len(self.doc) > 1:
+                self._draw_header()
+
+    def flush(self) -> None:
+        if self.writer is not None and self.page is not None:
+            self.writer.write_text(self.page, color=self.t.text_color_rgb)
+            self.writer = None
+
+    def _draw_furniture_line(self, text: str, baseline: float, size: float) -> None:
+        assert self.page is not None
+        writer = fitz.TextWriter(self.page.rect)
+        width = _text_width(text, self.fonts.regular, size)
+        x = self.t.margin_left_pt + (self.t.content_width - width) / 2
+        _append_text(writer, x, baseline, text, self.fonts.regular, size)
+        writer.write_text(self.page, color=self.t.secondary_color_rgb)
+
+    def _draw_footer(self) -> None:
+        if not self.t.include_page_numbers:
+            return
+        baseline = self.t.page_height_pt - self.t.margin_bottom_pt * 0.5
+        self._draw_furniture_line(str(len(self.doc)), baseline, self.t.footer_font_size)
+
+    def _draw_header(self) -> None:
+        baseline = self.t.margin_top_pt * 0.55
+        self._draw_furniture_line(self.t.title, baseline, self.t.header_font_size)
+
+    # -- content ----------------------------------------------------------
+    def _ensure_space(self, height: float) -> None:
+        if self.page is None or self.writer is None:
+            self.new_page()
+            return
+        bottom = self.t.page_height_pt - self.t.margin_bottom_pt
+        if self.y + height > bottom:
+            self.new_page()
+
+    def draw_heading(self, text: str) -> None:
+        size = self.t.chapter_font_size
+        line_height = size * 1.25
+        # Keep a heading with at least a couple of body lines.
+        self._ensure_space(line_height + self.t.font_size * self.t.line_spacing * 2)
+        self.y += size * 0.4
+
+        for index, line in enumerate(
+            _wrap_paragraph(text, self.fonts.bold, size, self.t.content_width, 0.0)
+        ):
+            self._ensure_space(line_height)
+            assert self.writer is not None
+            baseline = _line_baseline(self.fonts.bold, size, 1.25, self.y)
+            x = self.t.margin_left_pt + (self.t.content_width - line.width) / 2
+            _append_text(self.writer, x, baseline, " ".join(line.words), self.fonts.bold, size)
+            self.y += line_height
+            if index == 0:
+                self._record_toc(text)
+
+        self.y += size * 0.5
+
+    def _record_toc(self, text: str) -> None:
+        page_no = len(self.doc)
+        if self.toc and self.toc[-1][2] == page_no and self.toc[-1][1] == text:
+            return
+        self.toc.append([1, text, page_no])
+
+    def draw_paragraph(self, text: str, indent: bool = True) -> None:
+        size = self.t.font_size
+        line_height = size * self.t.line_spacing
+        first_indent = self.t.paragraph_indent_em * size if indent else 0.0
+        lines = _wrap_paragraph(
+            text, self.fonts.regular, size, self.t.content_width, first_indent
+        )
+        justify = self.t.body_align == "justify"
+
+        for index, line in enumerate(lines):
+            self._ensure_space(line_height)
+            assert self.writer is not None
+            baseline = _line_baseline(self.fonts.regular, size, self.t.line_spacing, self.y)
+
+            extra = 0.0
+            if justify and index < len(lines) - 1 and len(line.words) > 1:
+                extra = max(
+                    0.0, (self.t.content_width - line.indent - line.width) / (len(line.words) - 1)
+                )
+
+            x = self.t.margin_left_pt + line.indent
+            for word_index, word in enumerate(line.words):
+                # Include the trailing space glyph: positional gaps alone are
+                # invisible to text extraction, which breaks copy/paste and
+                # full-text search.
+                last = word_index == len(line.words) - 1
+                chunk = word if last else f"{word} "
+                x = _append_text(
+                    self.writer, x, baseline, chunk, self.fonts.regular, size
+                )
+                if not last:
+                    x += extra
+
+            self.y += line_height
+
+
+def _atomic_save(doc: fitz.Document, output_path: str) -> None:
+    """Write via a sibling temp file so a failed render never truncates output."""
+    tmp_path = f"{output_path}.tmp"
+    doc.save(tmp_path, deflate=True, garbage=4, clean=True)
+    os.replace(tmp_path, output_path)
 
 
 def parse_input_source(
@@ -101,6 +441,19 @@ class BookRenderer:
     def __init__(self, template: BookTemplate | None = None) -> None:
         self.template = template or BookTemplate()
 
+    def _warn_on_missing_glyphs(self, text: str) -> None:
+        missing = validate_font_coverage(
+            self.template.font_path, text, self.template.font_latin_path
+        )
+        if missing:
+            warnings.warn(
+                f"{os.path.basename(self.template.font_path)} has no glyph for "
+                f"{len(missing)} character(s): {''.join(missing[:20])}. "
+                "They will render as .notdef.",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+
     def render_pdf(
         self,
         results: list[dict[str, Any]] | str | Path,
@@ -113,172 +466,57 @@ class BookRenderer:
         sorted_results = sorted(pages_data, key=lambda x: _page_sort_key(x.get("page", "")))
 
         os.makedirs(os.path.dirname(os.path.abspath(output_path)) or ".", exist_ok=True)
+
+        if not os.path.exists(self.template.font_path):
+            self.template.font_path = find_default_ethiopic_font()
+
+        corpus = "\n".join(str(item.get("text", "")) for item in sorted_results)
+        self._warn_on_missing_glyphs(corpus)
+
+        fonts = _load_fonts(self.template)
         doc = fitz.open()
+        try:
+            layout = _PdfLayout(doc, self.template, fonts)
 
-        font_file = self.template.font_path
-        if not os.path.exists(font_file):
-            font_file = find_default_ethiopic_font()
+            for item in sorted_results:
+                cleaned = _clean_ocr_text(str(item.get("text", "")))
+                if not cleaned:
+                    continue
 
-        font_registered_name = "ethiopic_body"
-        # Ethiopic fonts have no Arabic digits, so page numbers use the Latin
-        # companion face.
-        latin_font_file = self.template.font_latin_path or font_file
-
-        text_rect = fitz.Rect(*self.template.text_rect)
-        line_height = self.template.line_spacing
-
-        # Collect page content
-        for item in sorted_results:
-            raw_text = item.get("text", "")
-            cleaned = _clean_ocr_text(raw_text)
-            if not cleaned:
-                continue
-
-            paragraphs = [p.strip() for p in cleaned.split("\n") if p.strip()]
-            if not paragraphs:
-                continue
-
-            p_idx = 0
-            while p_idx < len(paragraphs):
-                page = doc.new_page(
-                    width=self.template.page_width_pt,
-                    height=self.template.page_height_pt,
-                )
-                page.insert_font(fontname=font_registered_name, fontfile=font_file)
-
-                # Try putting all remaining paragraphs of this book page
-                candidate_text = "\n\n".join(paragraphs[p_idx:])
-                rc = page.insert_textbox(
-                    text_rect,
-                    candidate_text,
-                    fontname=font_registered_name,
-                    fontsize=self.template.font_size,
-                    lineheight=line_height,
-                )
-
-                if rc >= 0:
-                    # Fits on this single page
-                    break
-
-                # Overflow: remove page and binary search to find maximum fitting paragraphs
-                doc.delete_page(len(doc) - 1)
-
-                low = 1
-                high = len(paragraphs) - p_idx
-                best = 1
-                while low <= high:
-                    mid = (low + high) // 2
-                    test_page = doc.new_page(
-                        width=self.template.page_width_pt,
-                        height=self.template.page_height_pt,
-                    )
-                    test_page.insert_font(
-                        fontname=font_registered_name, fontfile=font_file
-                    )
-                    test_text = "\n\n".join(paragraphs[p_idx : p_idx + mid])
-                    rc = test_page.insert_textbox(
-                        text_rect,
-                        test_text,
-                        fontname=font_registered_name,
-                        fontsize=self.template.font_size,
-                        lineheight=line_height,
-                    )
-                    doc.delete_page(len(doc) - 1)
-                    if rc >= 0:
-                        best = mid
-                        low = mid + 1
+                for block in _reflow_blocks(cleaned):
+                    if block.heading:
+                        has_content = layout.y > self.template.margin_top_pt + 1
+                        if self.template.break_pages_at_markers and has_content:
+                            layout.new_page()
+                        layout.draw_heading(block.text)
                     else:
-                        high = mid - 1
+                        layout.draw_paragraph(block.text)
+                    # Paragraphs keep flowing; only headings may break pages.
 
-                # Insert the best fitting slice
-                fit_page = doc.new_page(
-                    width=self.template.page_width_pt,
-                    height=self.template.page_height_pt,
-                )
-                fit_page.insert_font(
-                    fontname=font_registered_name, fontfile=font_file
-                )
-                fit_text = "\n\n".join(paragraphs[p_idx : p_idx + best])
-                fit_page.insert_textbox(
-                    text_rect,
-                    fit_text,
-                    fontname=font_registered_name,
-                    fontsize=self.template.font_size,
-                    lineheight=line_height,
-                )
-                p_idx += best
+            if len(doc) == 0:
+                layout.new_page()
+                layout.draw_heading(self.template.title)
 
-        # If document is empty (no text extracted), create at least one placeholder page
-        if len(doc) == 0:
-            p = doc.new_page(
-                width=self.template.page_width_pt,
-                height=self.template.page_height_pt,
+            layout.flush()
+
+            doc.set_metadata(
+                {
+                    "title": self.template.title,
+                    "author": self.template.author or "",
+                    "creator": "Amharic OCR Book Renderer",
+                    "producer": "PyMuPDF",
+                    "subject": self.template.language,
+                }
             )
-            p.insert_font(fontname=font_registered_name, fontfile=font_file)
-            p.insert_textbox(
-                text_rect,
-                self.template.title,
-                fontname=font_registered_name,
-                fontsize=self.template.font_size,
-            )
+            if layout.toc:
+                doc.set_toc(layout.toc)
+            if hasattr(doc, "set_language"):
+                doc.set_language(self.template.language)
 
-        # Apply running headers and footer page numbers
-        footer_top = self.template.page_height_pt - self.template.margin_bottom_pt + 8
-        footer_bottom = self.template.page_height_pt - 12
-        footer_rect = fitz.Rect(
-            self.template.margin_left_pt,
-            footer_top,
-            self.template.page_width_pt - self.template.margin_right_pt,
-            footer_bottom,
-        )
-
-        header_top = 15
-        header_bottom = self.template.margin_top_pt - 8
-        header_rect = fitz.Rect(
-            self.template.margin_left_pt,
-            header_top,
-            self.template.page_width_pt - self.template.margin_right_pt,
-            header_bottom,
-        )
-
-        total_pages = len(doc)
-        for page_idx, page in enumerate(doc, start=1):
-            page.insert_font(fontname=font_registered_name, fontfile=font_file)
-            page.insert_font(fontname="latin_body", fontfile=latin_font_file)
-
-            if self.template.include_page_numbers:
-                num_str = str(page_idx)
-                page.insert_textbox(
-                    footer_rect,
-                    num_str,
-                    fontname="latin_body",
-                    fontsize=self.template.footer_font_size,
-                    color=self.template.secondary_color_rgb,
-                    align=fitz.TEXT_ALIGN_CENTER,
-                )
-
-            if self.template.include_running_header and page_idx > 1:
-                page.insert_textbox(
-                    header_rect,
-                    self.template.title,
-                    fontname=font_registered_name,
-                    fontsize=self.template.header_font_size,
-                    align=fitz.TEXT_ALIGN_CENTER,
-                )
-
-        # Set document metadata
-        doc.set_metadata(
-            {
-                "title": self.template.title,
-                "author": self.template.author or "Unknown",
-                "creator": "Amharic OCR Book Renderer",
-                "producer": "PyMuPDF",
-            }
-        )
-
-        doc.save(output_path, deflate=True)
-        doc.close()
-        return output_path
+            _atomic_save(doc, output_path)
+            return output_path
+        finally:
+            doc.close()
 
     def render_epub(
         self,
@@ -413,6 +651,16 @@ p {{
         return output_path
 
 
+def _safe_slug(title: str, max_bytes: int = 120) -> str:
+    """Filesystem-safe slug, truncated by UTF-8 byte length (Amharic is 3B/char)."""
+    slug = re.sub(r"[^\w\s-]", "", title).strip()
+    slug = re.sub(r"[\s-]+", "_", slug) or "book"
+    encoded = slug.encode("utf-8")
+    if len(encoded) > max_bytes:
+        slug = encoded[:max_bytes].decode("utf-8", errors="ignore").rstrip("_") or "book"
+    return slug
+
+
 def render_book(
     source: list[dict[str, Any]] | str | Path,
     output_dir: str = "rendered",
@@ -440,8 +688,7 @@ def render_book(
     renderer = BookRenderer(template)
     os.makedirs(output_dir, exist_ok=True)
 
-    slug = re.sub(r"[^\w\s-]", "", template.title).strip()
-    slug = re.sub(r"[\s-]+", "_", slug) or "book"
+    slug = _safe_slug(template.title)
 
     outputs: dict[str, str] = {}
 
@@ -492,13 +739,23 @@ def main() -> None:
     parser.add_argument(
         "--font",
         default="",
-        help="Path to Ethiopic TTF font file (defaults to auto-detected system font)",
+        help="Path to Ethiopic TTF font file (defaults to bundled Noto Serif Ethiopic)",
     )
     parser.add_argument(
         "--page-size",
-        choices=["novel_6x9", "novel_digest", "a5", "a4"],
+        choices=sorted(["novel_6x9", "novel_digest", "a5", "a4", "letter"]),
         default="novel_6x9",
         help="Page size preset (default: novel_6x9)",
+    )
+    parser.add_argument(
+        "--paper",
+        choices=["cream", "ivory", "sepia", "white"],
+        default="cream",
+        help="Page background (default: cream; use white for print)",
+    )
+    parser.add_argument("--font-size", type=float, default=0.0, help="Body font size in pt")
+    parser.add_argument(
+        "--line-spacing", type=float, default=0.0, help="Line height multiplier"
     )
 
     args = parser.parse_args()
@@ -513,10 +770,18 @@ def main() -> None:
         tmpl.author = args.author
     if args.font:
         tmpl.font_path = args.font
+    if args.font_size > 0:
+        tmpl.font_size = args.font_size
+    if args.line_spacing > 0:
+        tmpl.line_spacing = args.line_spacing
+
+    from books.template import PAPER_COLORS
+
+    tmpl.page_bg_hex = PAPER_COLORS[args.paper]
 
     print(f"📖 Rendering book: '{tmpl.title}'" + (f" by {tmpl.author}" if tmpl.author else ""))
     print(f"📐 Page size: {tmpl.page_size} ({tmpl.page_width_pt}x{tmpl.page_height_pt} pt)")
-    print(f"🔤 Font: {tmpl.font_path}")
+    print(f"🔤 Font: {tmpl.font_path} @ {tmpl.font_size} pt / {tmpl.line_spacing} lh")
 
     outputs = render_book(
         args.input,

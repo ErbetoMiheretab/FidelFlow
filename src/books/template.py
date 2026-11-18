@@ -37,6 +37,15 @@ PAGE_MARGINS: dict[str, tuple[float, float, float, float]] = {
 # distro font availability varies (many images ship none of the system paths).
 ASSETS_DIR = Path(__file__).resolve().parent / "assets" / "fonts"
 
+# Screen-friendly paper tints. Pure white is kept for print jobs, where a
+# full-bleed background wastes ink and looks grey on real paper.
+PAPER_COLORS: dict[str, str] = {
+    "cream": "#FBF7EF",
+    "ivory": "#FAF6EE",
+    "sepia": "#F7F3E8",
+    "white": "#FFFFFF",
+}
+
 # Preferred order: full Ethiopic coverage, real hinting, and a bold companion.
 # Senamirmir WashRa is kept only as a last resort: Wookianos covers 342/384
 # codepoints of the base Ethiopic block and none of Ethiopic Supplement /
@@ -139,22 +148,39 @@ def is_ethiopic(char: str) -> bool:
 COVERAGE_SAMPLE = "ሀለሐመሠረሰሸቀበተኀነአከወዐዘዠየደጀገጠጨፀፈፐሇዯቬፇ"
 
 
-def validate_font_coverage(font_path: str, text: str = "") -> list[str]:
+def validate_font_coverage(
+    font_path: str,
+    text: str = "",
+    latin_font_path: str = "",
+) -> list[str]:
     """
-    Return the distinct characters in *text* that the font cannot render.
+    Return the distinct characters in *text* that no available font can render.
 
+    Ethiopic characters are checked against *font_path*; everything else
+    (digits, Latin letters, punctuation) against *latin_font_path* when given.
     Scanning a real corpus is the only reliable way to catch holes in legacy
-    Ethiopic fonts; an empty list means every character has a glyph.
+    Ethiopic fonts.
     """
     if not font_path or not os.path.exists(font_path):
         return sorted(set(text))
 
     import fitz  # Local import so metadata helpers stay dependency-free.
 
-    font = fitz.Font(fontfile=font_path)
-    sample = COVERAGE_SAMPLE + text
-    missing = sorted({ch for ch in sample if ch.strip() and not font.has_glyph(ord(ch))})
-    return missing
+    ethiopic_font = fitz.Font(fontfile=font_path)
+    latin_font = (
+        fitz.Font(fontfile=latin_font_path)
+        if latin_font_path and os.path.exists(latin_font_path)
+        else ethiopic_font
+    )
+
+    missing: set[str] = set()
+    for char in COVERAGE_SAMPLE + text:
+        if not char.strip():
+            continue
+        font = ethiopic_font if is_ethiopic(char) else latin_font
+        if not font.has_glyph(ord(char)):
+            missing.add(char)
+    return sorted(missing)
 
 
 def hex_to_rgb(value: str) -> tuple[float, float, float]:
@@ -262,7 +288,7 @@ class BookTemplate:
     body_align: str = "justify"  # "justify" or "left"
 
     # Colors (screen-friendly warm paper; use #FFFFFF for print)
-    page_bg_hex: str = "#FBF7EF"
+    page_bg_hex: str = PAPER_COLORS["cream"]
     text_color_hex: str = "#1C1A17"
     secondary_color_hex: str = "#5E5A54"
 
