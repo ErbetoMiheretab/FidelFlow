@@ -12,9 +12,11 @@ import os
 import re
 import uuid
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import quote
 
 import fitz  # PyMuPDF
 from ebooklib import epub
@@ -123,8 +125,8 @@ def _load_font_pair(ethiopic_path: str, latin_path: str) -> _FontPair:
     )
 
 
-def _load_fonts(template: BookTemplate) -> _FontSet:
-    regular = _load_font_pair(template.font_path, template.font_latin_path)
+def _load_fonts(template: BookTemplate, font_path: str | None = None) -> _FontSet:
+    regular = _load_font_pair(font_path or template.font_path, template.font_latin_path)
     if template.font_bold_path:
         bold_ethiopic = fitz.Font(fontfile=template.font_bold_path)
         bold_latin_path = template.font_latin_bold_path
@@ -267,6 +269,8 @@ class _PdfLayout:
         self.writer: fitz.TextWriter | None = None
         self.y = 0.0
         self.toc: list[list[Any]] = []
+        # Front matter (title page) is unnumbered; body numbering starts at 1.
+        self.page_number_offset = 0
 
     # -- page lifecycle ---------------------------------------------------
     def new_page(self, furniture: bool = True) -> None:
@@ -300,12 +304,68 @@ class _PdfLayout:
     def _draw_footer(self) -> None:
         if not self.t.include_page_numbers:
             return
+        number = len(self.doc) - self.page_number_offset
         baseline = self.t.page_height_pt - self.t.margin_bottom_pt * 0.5
-        self._draw_furniture_line(str(len(self.doc)), baseline, self.t.footer_font_size)
+        self._draw_furniture_line(str(number), baseline, self.t.footer_font_size)
 
     def _draw_header(self) -> None:
+        header = f"{self.t.author} — {self.t.title}" if self.t.author else self.t.title
         baseline = self.t.margin_top_pt * 0.55
-        self._draw_furniture_line(self.t.title, baseline, self.t.header_font_size)
+        self._draw_furniture_line(header, baseline, self.t.header_font_size)
+
+    def add_title_page(self) -> None:
+        """Centered title/author page; excluded from body page numbering."""
+        self.new_page(furniture=False)
+        assert self.page is not None
+
+        title_size = self.t.title_font_size
+        title_leading = title_size * 1.15
+        title_lines = _wrap_paragraph(
+            self.t.title, self.fonts.bold, title_size, self.t.content_width, 0.0
+        )
+        author_size = self.t.font_size * 1.25
+        author_lines = (
+            _wrap_paragraph(
+                self.t.author, self.fonts.regular, author_size, self.t.content_width, 0.0
+            )
+            if self.t.author
+            else []
+        )
+        gap = title_size * 0.9
+        block_height = (
+            len(title_lines) * title_leading
+            + (gap + len(author_lines) * author_size * 1.3 if author_lines else 0.0)
+        )
+        y = max(self.t.margin_top_pt, (self.t.page_height_pt - block_height) / 2 - 24)
+
+        writer = fitz.TextWriter(self.page.rect)
+        for line in title_lines:
+            baseline = _line_baseline(self.fonts.bold, title_size, 1.15, y)
+            x = self.t.margin_left_pt + (self.t.content_width - line.width) / 2
+            _append_text(
+                writer, x, baseline, " ".join(line.words), self.fonts.bold, title_size
+            )
+            y += title_leading
+
+        if author_lines:
+            y += gap
+            for line in author_lines:
+                baseline = _line_baseline(self.fonts.regular, author_size, 1.3, y)
+                x = self.t.margin_left_pt + (self.t.content_width - line.width) / 2
+                _append_text(
+                    writer,
+                    x,
+                    baseline,
+                    " ".join(line.words),
+                    self.fonts.regular,
+                    author_size,
+                )
+                y += author_size * 1.3
+
+        writer.write_text(self.page, color=self.t.text_color_rgb)
+        self.page_number_offset = len(self.doc)
+        self.writer = None
+        self.page = None
 
     # -- content ----------------------------------------------------------
     def _ensure_space(self, height: float) -> None:
@@ -379,11 +439,64 @@ class _PdfLayout:
             self.y += line_height
 
 
+_FONT_MEDIA_TYPES = {
+    ".ttf": "font/ttf",
+    ".otf": "font/otf",
+    ".woff": "font/woff",
+    ".woff2": "font/woff2",
+}
+
+_FONT_FORMATS = {
+    ".ttf": "truetype",
+    ".otf": "opentype",
+    ".woff": "woff",
+    ".woff2": "woff2",
+}
+
+
+def _font_media_type(filename: str) -> str:
+    return _FONT_MEDIA_TYPES.get(Path(filename).suffix.lower(), "font/ttf")
+
+
+def _font_format(filename: str) -> str:
+    return _FONT_FORMATS.get(Path(filename).suffix.lower(), "truetype")
+
+
+def _epub_xhtml(title: str, language: str, body: str) -> str:
+    return f"""<?xml version='1.0' encoding='utf-8'?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="{language}" lang="{language}">
+<head>
+    <title>{html.escape(title)}</title>
+    <link rel="stylesheet" href="style/default.css" type="text/css"/>
+</head>
+<body>
+{body}
+</body>
+</html>"""
+
+
 def _atomic_save(doc: fitz.Document, output_path: str) -> None:
     """Write via a sibling temp file so a failed render never truncates output."""
     tmp_path = f"{output_path}.tmp"
     doc.save(tmp_path, deflate=True, garbage=4, clean=True)
     os.replace(tmp_path, output_path)
+
+
+def _validate_page_results(pages: Any, origin: str) -> list[dict[str, Any]]:
+    """Fail early with a useful message instead of mid-render KeyErrors."""
+    if not isinstance(pages, list):
+        raise ValueError(
+            f"{origin}: expected a list of page objects, got {type(pages).__name__}"
+        )
+    for index, item in enumerate(pages):
+        if not isinstance(item, dict):
+            raise ValueError(
+                f"{origin}: page #{index + 1} is {type(item).__name__}, expected an object"
+            )
+        if "text" in item and not isinstance(item["text"], str):
+            raise ValueError(f"{origin}: page #{index + 1} has a non-string 'text'")
+    return pages
 
 
 def parse_input_source(
@@ -394,7 +507,7 @@ def parse_input_source(
     Returns (page_results, suggested_title).
     """
     if isinstance(source, list):
-        return source, ""
+        return _validate_page_results(source, "<memory>"), ""
 
     path = str(source)
     if not os.path.exists(path):
@@ -403,13 +516,18 @@ def parse_input_source(
     suggested_title = Path(path).stem
 
     if path.endswith(".json"):
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{path}: invalid JSON ({exc})") from exc
         if isinstance(data, list):
-            return data, suggested_title
+            return _validate_page_results(data, path), suggested_title
         if isinstance(data, dict) and "pages" in data:
-            return data["pages"], suggested_title
-        raise ValueError(f"Unexpected JSON structure in {path}")
+            return _validate_page_results(data["pages"], path), suggested_title
+        raise ValueError(
+            f"{path}: expected a JSON list of pages or an object with a 'pages' key"
+        )
 
     if path.endswith(".txt"):
         with open(path, "r", encoding="utf-8") as f:
@@ -428,7 +546,7 @@ def parse_input_source(
             # Single text file without page markers
             results.append({"page": "1", "text": content})
 
-        return results, suggested_title
+        return _validate_page_results(results, path), suggested_title
 
     raise ValueError(f"Unsupported file extension for book rendering: {path}")
 
@@ -441,13 +559,13 @@ class BookRenderer:
     def __init__(self, template: BookTemplate | None = None) -> None:
         self.template = template or BookTemplate()
 
-    def _warn_on_missing_glyphs(self, text: str) -> None:
+    def _warn_on_missing_glyphs(self, text: str, font_path: str) -> None:
         missing = validate_font_coverage(
-            self.template.font_path, text, self.template.font_latin_path
+            font_path, text, self.template.font_latin_path
         )
         if missing:
             warnings.warn(
-                f"{os.path.basename(self.template.font_path)} has no glyph for "
+                f"{os.path.basename(font_path)} has no glyph for "
                 f"{len(missing)} character(s): {''.join(missing[:20])}. "
                 "They will render as .notdef.",
                 RuntimeWarning,
@@ -467,16 +585,18 @@ class BookRenderer:
 
         os.makedirs(os.path.dirname(os.path.abspath(output_path)) or ".", exist_ok=True)
 
-        if not os.path.exists(self.template.font_path):
-            self.template.font_path = find_default_ethiopic_font()
+        font_path = self.template.font_path
+        if not font_path or not os.path.exists(font_path):
+            font_path = find_default_ethiopic_font()
 
         corpus = "\n".join(str(item.get("text", "")) for item in sorted_results)
-        self._warn_on_missing_glyphs(corpus)
+        self._warn_on_missing_glyphs(corpus, font_path)
 
-        fonts = _load_fonts(self.template)
+        fonts = _load_fonts(self.template, font_path)
         doc = fitz.open()
         try:
             layout = _PdfLayout(doc, self.template, fonts)
+            layout.add_title_page()
 
             for item in sorted_results:
                 cleaned = _clean_ocr_text(str(item.get("text", "")))
@@ -493,7 +613,8 @@ class BookRenderer:
                         layout.draw_paragraph(block.text)
                     # Paragraphs keep flowing; only headings may break pages.
 
-            if len(doc) == 0:
+            if layout.page is None:
+                # No usable OCR text: still ship a readable placeholder page.
                 layout.new_page()
                 layout.draw_heading(self.template.title)
 
@@ -505,13 +626,22 @@ class BookRenderer:
                     "author": self.template.author or "",
                     "creator": "Amharic OCR Book Renderer",
                     "producer": "PyMuPDF",
-                    "subject": self.template.language,
+                    "keywords": f"lang={self.template.language}",
                 }
             )
             if layout.toc:
                 doc.set_toc(layout.toc)
             if hasattr(doc, "set_language"):
                 doc.set_language(self.template.language)
+            if hasattr(doc, "set_page_labels"):
+                labels = [
+                    {"startpage": 0, "prefix": "", "style": "r", "firstpagenum": 1}
+                ]
+                if len(doc) > 1:
+                    labels.append(
+                        {"startpage": 1, "prefix": "", "style": "D", "firstpagenum": 1}
+                    )
+                doc.set_page_labels(labels)
 
             _atomic_save(doc, output_path)
             return output_path
@@ -538,56 +668,79 @@ class BookRenderer:
 
         if self.template.author:
             book.add_author(self.template.author)
+        book.add_metadata(
+            "DC", "date", datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        )
 
-        # Embed font if available
-        font_file = self.template.font_path
-        font_css_face = ""
-        font_filename = ""
-        if os.path.exists(font_file):
-            font_filename = os.path.basename(font_file)
-            with open(font_file, "rb") as ff:
-                font_data = ff.read()
-            font_item = epub.EpubItem(
-                uid="font_ethiopic",
-                file_name=f"fonts/{font_filename}",
-                media_type="font/ttf",
-                content=font_data,
+        # Embed the text face: Ethiopic body + Latin companion for digits/Latin,
+        # both with their bold weights.
+        font_faces: list[str] = []
+        font_counter = 0
+
+        def add_font(path: str, family: str, weight: str) -> None:
+            nonlocal font_counter
+            if not path or not os.path.exists(path):
+                return
+            filename = os.path.basename(path)
+            with open(path, "rb") as handle:
+                data = handle.read()
+            font_counter += 1
+            book.add_item(
+                epub.EpubItem(
+                    uid=f"font_{font_counter}",
+                    file_name=f"fonts/{filename}",
+                    media_type=_font_media_type(filename),
+                    content=data,
+                )
             )
-            book.add_item(font_item)
-            font_css_face = f"""
-@font-face {{
-    font-family: 'EthiopicNovelFont';
-    src: url('../fonts/{font_filename}');
-}}
-"""
+            font_faces.append(
+                "@font-face {"
+                f" font-family: '{family}'; font-weight: {weight}; font-style: normal;"
+                f" src: url('../fonts/{quote(filename)}')"
+                f" format('{_font_format(filename)}');"
+                " }"
+            )
 
-        css_content = f"""
-{font_css_face}
+        add_font(self.template.font_path, "EthiopicNovelFont", "normal")
+        add_font(self.template.font_bold_path, "EthiopicNovelFont", "bold")
+        add_font(self.template.font_latin_path, "LatinNovelFont", "normal")
+        add_font(self.template.font_latin_bold_path, "LatinNovelFont", "bold")
+
+        css_content = "\n".join(font_faces) + f"""
 body {{
-    font-family: 'EthiopicNovelFont', 'Noto Sans Ethiopic', 'Abyssinica SIL', serif;
-    font-size: 1.05em;
-    line-height: {self.template.line_spacing};
-    margin: 6%;
-    text-align: justify;
+    font-family: 'EthiopicNovelFont', 'LatinNovelFont', 'Noto Serif Ethiopic', 'Abyssinica SIL', serif;
+    font-size: 1em;
+    line-height: {self.template.epub_line_height};
+    color: {self.template.text_color_hex};
+    background-color: {self.template.page_bg_hex};
+    margin: 0;
+    padding: 0;
+    text-align: left;
 }}
-h1, h2, h3 {{
-    font-family: 'EthiopicNovelFont', 'Noto Sans Ethiopic', serif;
+h1.book-title {{
+    font-size: 2em;
     text-align: center;
-    margin-top: 1.6em;
-    margin-bottom: 0.8em;
+    margin: 3em 0 0.4em;
+}}
+p.book-author {{
+    text-align: center;
+    font-size: 1.15em;
+    margin: 0 0 3em;
+}}
+h2 {{
+    font-size: 1.4em;
+    text-align: center;
+    margin: 1.8em 0 1em;
+    page-break-after: avoid;
+    break-after: avoid;
 }}
 p {{
-    margin-top: 0;
-    margin-bottom: 0.6em;
-    text-indent: 1.5em;
+    margin: 0;
+    text-indent: {self.template.paragraph_indent_em}em;
+    text-align: {"justify" if self.template.body_align == "justify" else "left"};
 }}
-.page-header {{
-    font-size: 0.8em;
-    color: #666;
-    text-align: center;
-    border-bottom: 1px solid #ddd;
-    padding-bottom: 4px;
-    margin-bottom: 1em;
+h2 + p, p.first {{
+    text-indent: 0;
 }}
 """
         default_css = epub.EpubItem(
@@ -598,60 +751,95 @@ p {{
         )
         book.add_item(default_css)
 
-        chapters = []
-        for i, item in enumerate(sorted_results, start=1):
-            raw_text = item.get("text", "")
-            cleaned = _clean_ocr_text(raw_text)
-            if not cleaned:
+        def blocks_for(item: dict[str, Any]) -> list[_Block]:
+            return _reflow_blocks(_clean_ocr_text(str(item.get("text", ""))))
+
+        all_blocks = [block for item in sorted_results for block in blocks_for(item)]
+        has_headings = any(block.heading for block in all_blocks)
+
+        # Chapter units: natural chapters when the OCR has ምዕራፍ markers,
+        # otherwise fixed-size page groups so the TOC stays navigable.
+        specs: list[tuple[str, list[_Block]]] = []
+        if has_headings:
+            chapter_title = ""
+            chapter_blocks: list[_Block] = []
+            for block in all_blocks:
+                if block.heading:
+                    if chapter_title or chapter_blocks:
+                        specs.append((chapter_title or "Front Matter", chapter_blocks))
+                    chapter_title, chapter_blocks = block.text, []
+                else:
+                    chapter_blocks.append(block)
+            if chapter_title or chapter_blocks:
+                specs.append((chapter_title or "Front Matter", chapter_blocks))
+        else:
+            size = max(1, self.template.epub_chapter_pages)
+            for start in range(0, len(sorted_results), size):
+                chunk = sorted_results[start : start + size]
+                chunk_blocks = [b for item in chunk for b in blocks_for(item)]
+                if chunk_blocks:
+                    end = min(start + size, len(sorted_results))
+                    specs.append(
+                        (f"{self.template.title} ({start + 1}–{end})", chunk_blocks)
+                    )
+
+        chapters: list[epub.EpubHtml] = []
+        for index, (chapter_title, chapter_blocks) in enumerate(specs, start=1):
+            body_parts: list[str] = []
+            heading_rendered = has_headings and chapter_title != "Front Matter"
+            if heading_rendered:
+                body_parts.append(f"<h2>{html.escape(chapter_title)}</h2>")
+            for block_index, block in enumerate(chapter_blocks):
+                if block.heading:
+                    body_parts.append(f"<h2>{html.escape(block.text)}</h2>")
+                    continue
+                css_class = ' class="first"' if block_index == 0 and not heading_rendered else ""
+                body_parts.append(
+                    f"<p{css_class}>{html.escape(block.text)}</p>"
+                )
+            if not body_parts:
                 continue
 
-            paragraphs = [p.strip() for p in cleaned.split("\n") if p.strip()]
-            p_html = "".join(f"<p>{html.escape(p)}</p>\n" for p in paragraphs)
-
-            page_id = item.get("page", str(i))
-            chapter_title = f"Page {page_id}"
-
-            c = epub.EpubHtml(
+            chapter = epub.EpubHtml(
                 title=chapter_title,
-                file_name=f"page_{i:04d}.xhtml",
+                file_name=f"chapter_{index:04d}.xhtml",
                 lang=self.template.language,
             )
-            c.content = f"""<?xml version='1.0' encoding='utf-8'?>
-<!DOCTYPE html>
-<html xmlns="http://www.w3.org/1999/xhtml">
-<head>
-    <title>{html.escape(chapter_title)}</title>
-    <link rel="stylesheet" href="style/default.css" type="text/css"/>
-</head>
-<body>
-    <div class="page-header">{html.escape(self.template.title)} - {html.escape(chapter_title)}</div>
-    {p_html}
-</body>
-</html>"""
-            c.add_item(default_css)
-            book.add_item(c)
-            chapters.append(c)
-
-        if not chapters:
-            # Fallback if no pages
-            c = epub.EpubHtml(
-                title="Title", file_name="title.xhtml", lang=self.template.language
+            chapter.content = _epub_xhtml(
+                chapter_title, self.template.language, "\n".join(body_parts)
             )
-            c.content = f"<h1>{html.escape(self.template.title)}</h1>"
-            c.add_item(default_css)
-            book.add_item(c)
-            chapters.append(c)
+            chapter.add_item(default_css)
+            book.add_item(chapter)
+            chapters.append(chapter)
+
+        title_body = f'<h1 class="book-title">{html.escape(self.template.title)}</h1>'
+        if self.template.author:
+            title_body += f'\n<p class="book-author">{html.escape(self.template.author)}</p>'
+        title_page = epub.EpubHtml(
+            title=self.template.title, file_name="title.xhtml", lang=self.template.language
+        )
+        title_page.content = _epub_xhtml(
+            self.template.title, self.template.language, title_body
+        )
+        title_page.add_item(default_css)
+        book.add_item(title_page)
 
         book.toc = tuple(chapters)
         book.add_item(epub.EpubNcx())
         book.add_item(epub.EpubNav())
 
-        book.spine = ["nav"] + chapters
-        epub.write_epub(output_path, book)
+        book.spine = ["nav", title_page] + chapters
+        tmp_path = f"{output_path}.tmp"
+        try:
+            epub.write_epub(tmp_path, book)
+            os.replace(tmp_path, output_path)
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
         return output_path
 
 
-def _safe_slug(title: str, max_bytes: int = 120) -> str:
+def safe_slug(title: str, max_bytes: int = 120) -> str:
     """Filesystem-safe slug, truncated by UTF-8 byte length (Amharic is 3B/char)."""
     slug = re.sub(r"[^\w\s-]", "", title).strip()
     slug = re.sub(r"[\s-]+", "_", slug) or "book"
@@ -671,6 +859,9 @@ def render_book(
     Convenience function to render book pages to PDF and/or EPUB.
     Returns a dict mapping format -> output path.
     """
+    if format not in ("pdf", "epub", "both"):
+        raise ValueError(f"format must be 'pdf', 'epub', or 'both', got {format!r}")
+
     data, suggested_title = parse_input_source(source)
 
     if template is None:
@@ -679,16 +870,19 @@ def render_book(
             if suggested_title
             else BookTemplate()
         )
-    elif not template.title or template.title == "Untitled Book":
-        if suggested_title:
-            template.title, auto_author = derive_metadata_from_filename(suggested_title)
+    else:
+        # Never mutate the caller's template: they may reuse it for several books.
+        template = replace(template)
+        if (not template.title or template.title == "Untitled Book") and suggested_title:
+            title, auto_author = derive_metadata_from_filename(suggested_title)
+            template.title = title
             if auto_author and not template.author:
                 template.author = auto_author
 
     renderer = BookRenderer(template)
     os.makedirs(output_dir, exist_ok=True)
 
-    slug = _safe_slug(template.title)
+    slug = safe_slug(template.title)
 
     outputs: dict[str, str] = {}
 
@@ -742,6 +936,14 @@ def main() -> None:
         help="Path to Ethiopic TTF font file (defaults to bundled Noto Serif Ethiopic)",
     )
     parser.add_argument(
+        "--bold-font", default="", help="Path to a bold Ethiopic font for headings"
+    )
+    parser.add_argument(
+        "--latin-font",
+        default="",
+        help="Path to a Latin font for digits/Latin text (defaults to bundled Noto Serif)",
+    )
+    parser.add_argument(
         "--page-size",
         choices=sorted(["novel_6x9", "novel_digest", "a5", "a4", "letter"]),
         default="novel_6x9",
@@ -757,8 +959,27 @@ def main() -> None:
     parser.add_argument(
         "--line-spacing", type=float, default=0.0, help="Line height multiplier"
     )
+    parser.add_argument(
+        "--body-align",
+        choices=["justify", "left"],
+        default="",
+        help="Body alignment (default: template setting, justify)",
+    )
+    parser.add_argument(
+        "--margin", type=float, default=0.0, help="Uniform page margin in pt"
+    )
+    parser.add_argument(
+        "--running-header", action="store_true", help="Add a running header with title/author"
+    )
+    parser.add_argument(
+        "--no-page-numbers", action="store_true", help="Omit footer page numbers"
+    )
 
     args = parser.parse_args()
+
+    for flag, value in (("--font", args.font), ("--bold-font", args.bold_font), ("--latin-font", args.latin_font)):
+        if value and not os.path.exists(value):
+            parser.error(f"{flag}: file not found: {value}")
 
     tmpl = BookTemplate.from_filename(
         args.input,
@@ -770,10 +991,21 @@ def main() -> None:
         tmpl.author = args.author
     if args.font:
         tmpl.font_path = args.font
+    if args.bold_font:
+        tmpl.font_bold_path = args.bold_font
+    if args.latin_font:
+        tmpl.font_latin_path = args.latin_font
     if args.font_size > 0:
         tmpl.font_size = args.font_size
     if args.line_spacing > 0:
         tmpl.line_spacing = args.line_spacing
+    if args.body_align:
+        tmpl.body_align = args.body_align
+    if args.margin > 0:
+        tmpl.margin_left_pt = tmpl.margin_right_pt = args.margin
+        tmpl.margin_top_pt = tmpl.margin_bottom_pt = args.margin
+    tmpl.include_page_numbers = not args.no_page_numbers
+    tmpl.include_running_header = args.running_header
 
     from books.template import PAPER_COLORS
 

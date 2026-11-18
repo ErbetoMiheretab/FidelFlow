@@ -307,6 +307,22 @@ class BookTemplate:
     extra_metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        if self.body_align not in ("justify", "left"):
+            raise ValueError(
+                f"body_align must be 'justify' or 'left', got {self.body_align!r}"
+            )
+        if self.font_size <= 0:
+            raise ValueError("font_size must be greater than zero")
+        if self.line_spacing < 1.0:
+            raise ValueError("line_spacing must be >= 1.0 to avoid overlapping lines")
+
+        unknown_preset = self.page_size not in PAGE_SIZES
+        if unknown_preset and self.page_width_pt <= 0:
+            raise ValueError(
+                f"Unknown page_size {self.page_size!r}. Choose one of: "
+                f"{', '.join(sorted(PAGE_SIZES))}, or pass explicit page_width_pt/page_height_pt."
+            )
+
         if self.page_size in PAGE_SIZES:
             dims = PAGE_SIZES[self.page_size]
             if self.page_width_pt <= 0:

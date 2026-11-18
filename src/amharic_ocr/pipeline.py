@@ -553,7 +553,7 @@ def run_pipeline(
     generate_review_report(all_results, report_out)
 
     if config.render_pdf or config.render_epub:
-        from books.renderer import BookRenderer
+        from books.renderer import BookRenderer, safe_slug
         from books.template import BookTemplate, derive_metadata_from_filename
 
         auto_title, auto_author = derive_metadata_from_filename(os.path.basename(pdf_path))
@@ -563,8 +563,7 @@ def run_pipeline(
         )
         renderer = BookRenderer(template)
         os.makedirs(config.rendered_dir, exist_ok=True)
-        slug = re.sub(r"[^\w\s-]", "", template.title).strip()
-        slug = re.sub(r"[\s-]+", "_", slug) or "book"
+        slug = safe_slug(template.title)
 
         if config.render_pdf:
             pdf_rendered_out = os.path.join(config.rendered_dir, f"{slug}.pdf")
