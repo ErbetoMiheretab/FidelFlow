@@ -120,6 +120,9 @@ class BookRenderer:
             font_file = find_default_ethiopic_font()
 
         font_registered_name = "ethiopic_body"
+        # Ethiopic fonts have no Arabic digits, so page numbers use the Latin
+        # companion face.
+        latin_font_file = self.template.font_latin_path or font_file
 
         text_rect = fitz.Rect(*self.template.text_rect)
         line_height = self.template.line_spacing
@@ -241,14 +244,16 @@ class BookRenderer:
         total_pages = len(doc)
         for page_idx, page in enumerate(doc, start=1):
             page.insert_font(fontname=font_registered_name, fontfile=font_file)
+            page.insert_font(fontname="latin_body", fontfile=latin_font_file)
 
             if self.template.include_page_numbers:
                 num_str = str(page_idx)
                 page.insert_textbox(
                     footer_rect,
                     num_str,
-                    fontname=font_registered_name,
+                    fontname="latin_body",
                     fontsize=self.template.footer_font_size,
+                    color=self.template.secondary_color_rgb,
                     align=fitz.TEXT_ALIGN_CENTER,
                 )
 
