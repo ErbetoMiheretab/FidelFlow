@@ -173,8 +173,13 @@ def validate_font_coverage(
         else ethiopic_font
     )
 
+    # Check each distinct character once (large books can contain hundreds of
+    # thousands of characters but only a small set of unique codepoints).
+    chars = set(COVERAGE_SAMPLE)
+    chars.update(text)
+
     missing: set[str] = set()
-    for char in COVERAGE_SAMPLE + text:
+    for char in chars:
         if not char.strip():
             continue
         font = ethiopic_font if is_ethiopic(char) else latin_font

@@ -479,7 +479,8 @@ def _epub_xhtml(title: str, language: str, body: str) -> str:
 def _atomic_save(doc: fitz.Document, output_path: str) -> None:
     """Write via a sibling temp file so a failed render never truncates output."""
     tmp_path = f"{output_path}.tmp"
-    doc.save(tmp_path, deflate=True, garbage=4, clean=True)
+    # garbage=2/deflate keep output compact with much less CPU than garbage=4.
+    doc.save(tmp_path, garbage=2, deflate=True)
     os.replace(tmp_path, output_path)
 
 

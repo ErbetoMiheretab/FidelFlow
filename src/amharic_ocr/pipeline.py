@@ -506,30 +506,52 @@ def run_pipeline(
     tasks = [(i + 1, pdf_path, config, image_dir) for i in range(num_pages)]
     all_results = []
 
-    max_workers = min(mp.cpu_count(), 4) if config.use_easyocr else min(mp.cpu_count(), 8)
+    # CPU-only throughput: parallelize across pages/processes and keep each
+    # Tesseract invocation single-threaded to avoid core oversubscription.
+    # EasyOCR on CPU is much heavier, so keep a lower cap there.
+    max_workers = min(mp.cpu_count(), 4) if config.use_easyocr else mp.cpu_count()
+    omp_prev = os.environ.get("OMP_THREAD_LIMIT")
+    os.environ["OMP_THREAD_LIMIT"] = "1"
 
-    if num_pages == 1:
-        page_results = process_single_page(tasks[0])
-        all_results.extend(page_results)
-        for r in page_results:
-            print(
-                f"  Page {r['page']}: Text length: {len(r['text'])} chars | "
-                f"Raw length: {len(r.get('raw_text', ''))} | "
-                f"Numerals found: {r['numerals_found']}"
-            )
-    else:
-        with mp.Pool(processes=max_workers) as pool:
-            for idx, page_results in enumerate(pool.imap(process_single_page, tasks)):
+    try:
+        if num_pages == 1 or max_workers <= 1:
+            for idx, task in enumerate(tasks):
+                page_results = process_single_page(task)
                 all_results.extend(page_results)
                 for r in page_results:
-                    print(
-                        f"  Page {r['page']}/{num_pages}: Text length: "
-                        f"{len(r['text'])} chars | Raw length: "
-                        f"{len(r.get('raw_text', ''))} | "
-                        f"Numerals found: {r['numerals_found']}"
-                    )
-                if status_callback:
+                    if num_pages == 1:
+                        print(
+                            f"  Page {r['page']}: Text length: {len(r['text'])} chars | "
+                            f"Raw length: {len(r.get('raw_text', ''))} | "
+                            f"Numerals found: {r['numerals_found']}"
+                        )
+                    else:
+                        print(
+                            f"  Page {r['page']}/{num_pages}: Text length: "
+                            f"{len(r['text'])} chars | Raw length: "
+                            f"{len(r.get('raw_text', ''))} | "
+                            f"Numerals found: {r['numerals_found']}"
+                        )
+                if status_callback and num_pages != 1:
                     status_callback(idx + 1, num_pages)
+        else:
+            with mp.Pool(processes=max_workers) as pool:
+                for idx, page_results in enumerate(pool.imap(process_single_page, tasks)):
+                    all_results.extend(page_results)
+                    for r in page_results:
+                        print(
+                            f"  Page {r['page']}/{num_pages}: Text length: "
+                            f"{len(r['text'])} chars | Raw length: "
+                            f"{len(r.get('raw_text', ''))} | "
+                            f"Numerals found: {r['numerals_found']}"
+                        )
+                    if status_callback:
+                        status_callback(idx + 1, num_pages)
+    finally:
+        if omp_prev is None:
+            os.environ.pop("OMP_THREAD_LIMIT", None)
+        else:
+            os.environ["OMP_THREAD_LIMIT"] = omp_prev
 
     txt_out = os.path.join(config.output_dir, f"{base_name}_output.txt")
     raw_out = os.path.join(config.output_dir, f"{base_name}_raw.txt")
@@ -553,6 +575,8 @@ def run_pipeline(
     generate_review_report(all_results, report_out)
 
     if config.render_pdf or config.render_epub:
+        import threading
+
         from books.renderer import BookRenderer, safe_slug
         from books.template import BookTemplate, derive_metadata_from_filename
 
@@ -561,19 +585,40 @@ def run_pipeline(
             title=config.book_title or auto_title,
             author=config.book_author or auto_author,
         )
-        renderer = BookRenderer(template)
         os.makedirs(config.rendered_dir, exist_ok=True)
         slug = safe_slug(template.title)
 
+        render_jobs: list[tuple[str, str, Callable[[str], str]]] = []
         if config.render_pdf:
             pdf_rendered_out = os.path.join(config.rendered_dir, f"{slug}.pdf")
-            renderer.render_pdf(all_results, pdf_rendered_out)
-            print(f"📖 Rendered Novel PDF: {pdf_rendered_out}")
-
+            render_jobs.append(
+                ("PDF", pdf_rendered_out, lambda path, r=BookRenderer(template): r.render_pdf(all_results, path))
+            )
         if config.render_epub:
             epub_rendered_out = os.path.join(config.rendered_dir, f"{slug}.epub")
-            renderer.render_epub(all_results, epub_rendered_out)
-            print(f"📗 Rendered EPUB: {epub_rendered_out}")
+            render_jobs.append(
+                ("EPUB", epub_rendered_out, lambda path, r=BookRenderer(template): r.render_epub(all_results, path))
+            )
+
+        errors: list[Exception] = []
+        threads: list[threading.Thread] = []
+
+        def _run_render(label: str, path: str, fn: Callable[[str], str]) -> None:
+            try:
+                fn(path)
+                icon = "📖" if label == "PDF" else "📗"
+                print(f"{icon} Rendered Novel {label}: {path}")
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        for label, path, fn in render_jobs:
+            t = threading.Thread(target=_run_render, args=(label, path, fn), daemon=True)
+            threads.append(t)
+            t.start()
+        for t in threads:
+            t.join()
+        if errors:
+            raise errors[0]
 
     total_numerals = sum(len(r["numerals_found"]) for r in all_results)
     flagged = sum(1 for r in all_results if r.get("flagged"))
